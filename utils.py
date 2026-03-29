@@ -1,17 +1,26 @@
 import json
 import struct
 import socket
+import time
 
 def sender(host, port):
-    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    conn.connect((host, port))
-    return conn
+    try:
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.settimeout(1)
+        conn.connect((host, port))   # BLOCKING
+        return conn
+    except Exception:
+        return None
 
 def listener(host, port):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((host, port))
-    server.listen(5)
-    return server
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind((host, port))
+        server.listen(5)
+        server.setblocking(False)
+        return server
+    except BlockingIOError:
+        pass
 
 def connect(server):
     conn, addr = server.accept()
@@ -27,24 +36,21 @@ def recv_exact(conn, n):
         data += chunk
     return data
 
-def send_message(conn:socket.socket, data:dict):
-
-    data_byte = json.dumps(data).encode()
-
-    data_len = len(data_byte)
-
-    header = struct.pack('!I', data_len)
-
-    message = header + data_byte
-
-    conn.sendall(message)
+def send_message(conn, data):
+    if conn is None:
+        return
+    try:
+        payload = json.dumps(data).encode()
+        header = struct.pack('!I', len(payload))
+        conn.sendall(header + payload)
+    finally:
+        conn.close()
 
 
 
 def receive_message(conn:socket.socket):
-
+    conn.settimeout(2)
     header = recv_exact(conn, 4)
-
     if header is None:
         return None
 
@@ -53,7 +59,20 @@ def receive_message(conn:socket.socket):
         return None
 
     length  = struct.unpack('!I', header)[0]
-
     data = recv_exact(conn, int(length))
-
     return json.loads(data.decode())
+
+def receiver_loop(server, msg_queue):
+    while True:
+        try:
+            conn, _ = server.accept()
+        except BlockingIOError:
+            time.sleep(0.01)
+            continue
+
+        try:
+            msg = receive_message(conn)
+            if msg:
+                msg_queue.put(msg)
+        finally:
+            conn.close()

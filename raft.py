@@ -1,12 +1,16 @@
 import socket
 import struct
 import json
-from utils import receive_message, send_message, sender, listener, connect
+from utils import receive_message, send_message, sender, listener, connect, receiver_loop
 from enum import Enum, auto
 import multiprocessing
 import time
+import random
+import threading
+import queue
+import sys
 
-ALL_NODES = [5000,5001]
+ALL_NODES = [5000,5001,5002,5003,5004]
 
 class NodeRole(Enum):
     LEADER = auto()
@@ -28,7 +32,7 @@ class KVStore:
             self.log.append({
                 "index": self.commit_index + 1 + i,
                 "term" : self.kv.current_term,
-                "entry" : entry[i]
+                "command" : entry[i]
             })
 
     def apply_loop(self):
@@ -71,7 +75,7 @@ class Raft:
             "BECOME_FOLLOWER": self.become_follower,
             "HIGHER_TERM" : self.higher_term,
             "COMMIT": self.commit,
-            "RESPOND_VOTE": self.respond_vote,
+            "REQUEST_VOTE": self.respond_vote,
             "GRANT_VOTE" : self.grant_vote,
         }
 
@@ -95,7 +99,7 @@ class Raft:
         for i in self.peers:
             conn = sender(self.host, i)
             prev_index = self.kv.next_index[i] - 1
-            prev_term = self.kv.log[prev_index]["term"]
+            prev_term = self.kv.log[prev_index]["term"] if prev_index >= 0 else -1
             msg = {
                 "method" :  "APPEND_ENTRIES",
                 "params" : {
@@ -156,20 +160,23 @@ class Raft:
 
         self.kv.apply_loop()
 
-        conn = sender(self.host, node_id)
-        msg = {
-            "method" :  "COMMIT",
-            "params" : {
-                "node_id" : self.port
+        if len(entry)>0:
+            conn = sender(self.host, node_id)
+            msg = {
+                "method" :  "COMMIT",
+                "params" : {
+                    "node_id" : self.port
+                }
             }
-        }
-        send_message(conn, msg)
+            send_message(conn, msg)
     
     def heartbeat(self):
         for i in self.peers:
+            print("Sending HeartBeat")
             conn = sender(self.host, i)
             prev_index = self.kv.next_index[i] - 1
-            prev_term = self.kv.log[prev_index]["term"]
+            print(f"Prev Index:{prev_index}, log length{len(self.kv.log)}")
+            prev_term = self.kv.log[prev_index]["term"] if prev_index >= 0 else -1
             msg = {
                 "method" :  "APPEND_ENTRIES",
                 "params" : {
@@ -183,6 +190,7 @@ class Raft:
             send_message(conn, msg)
     
     def check_leader(self):
+        # print("Checking for Leader")
         if time.time() - self.curr_time > self.timeout:
             self.become_candidate()
 
@@ -190,9 +198,9 @@ class Raft:
         for i in self.peers:
             conn = sender(self.host, i)
             prev_index = self.kv.next_index[i] - 1
-            prev_term = self.kv.log[prev_index]["term"]
+            prev_term = self.kv.log[prev_index]["term"] if prev_index >= 0 else -1
             msg = {
-                "method" :  "RESPOND_VOTE",
+                "method" :  "REQUEST_VOTE",
                 "params" : {
                     "node_id" : self.port,
                     "curr_term" : self.kv.current_term,
@@ -201,8 +209,10 @@ class Raft:
                 }
             }
             send_message(conn, msg)
+            print(f"Requesting Vote: {i}")
     
     def respond_vote(self, node_id, curr_term, prev_term, prev_index):
+        print(f"Respond Vote: {node_id}")
         vote_granted = False
 
         # 1. Reject stale term
@@ -211,7 +221,7 @@ class Raft:
 
         else:
             # If term is newer → update
-            if curr_term > self.kv.current_term:
+            if curr_term >= self.kv.current_term:
                 self.kv.current_term = curr_term
                 self.kv.voted_for = None
                 self.become_follower()
@@ -238,16 +248,24 @@ class Raft:
         msg = {
             "method": "GRANT_VOTE",
             "params": {
+                "node_id" : self.port,
                 "term": self.kv.current_term,
                 "vote_granted": vote_granted
             }
         }
         send_message(conn, msg)
 
-    def grant_vote(self, term, vote_granted):
+    def grant_vote(self,node_id, term, vote_granted):
+        if vote_granted:
+            print(f"Vote Granted by :{node_id}")
+        else:
+            print(f"Vote Rejected by :{node_id}")
+
         if term > self.kv.current_term:
             self.kv.current_term = term
+            self.kv.voted_for = None
             self.become_follower()
+            self.reset_time()
             return
 
         if self.role != NodeRole.CANDIDATE:
@@ -272,16 +290,27 @@ class Raft:
     
     def higher_term(self, term):
         if self.kv.current_term < term:
+            self.kv.voted_for = None
             self.become_follower()
+    
+    def start_election(self):
+        self.kv.current_term += 1
+        self.vote_count = 1
+        self.kv.voted_for = self.port
+        self.reset_time()
+        self.request_vote()
 
     def become_follower(self):
+        print("Become Follower")
         self.role = NodeRole.FOLLOWER
     
     def become_candidate(self):
-        self.kv.current_term += 1
+        print("Become Candidate")
         self.role = NodeRole.CANDIDATE
+        self.start_election()
 
     def become_leader(self):
+        print("Become Leader")
         self.role = NodeRole.LEADER
     
     def reset_time(self):
@@ -292,51 +321,43 @@ class Raft:
 
 
 def server(host, port):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((host, port))
-    server.listen(5)
-
+    msg_queue = queue.Queue()
+        
+    timeout = random.uniform(5, 10)  # better than large random
     kv = KVStore()
-    role = NodeRole.FOLLOWER
+    raft = Raft(host, port, kv, timeout=timeout)
 
-    follower = Follower(kv)
-    leader = Leader(kv, host, port)
+    threading.Thread(
+        target=receiver_loop,
+        args=(raft.server, msg_queue),
+        daemon=True
+    ).start()
+
+    print("Server started")
 
     while True:
-        conn, _ = server.accept()
-        msg = receive_message(conn)
+        # 1. Try to receive message (non-blocking style)
+        try:
+            while not msg_queue.empty():
+                msg = msg_queue.get()
+                raft.apply_message(msg)
+        except:
+            pass
 
-        if not msg:
-            conn.close()
-            continue
+        if raft.role != NodeRole.LEADER:
+            raft.check_leader()
 
-        
-        # -------- RAFT RPC --------
-        if msg.get("type") == "AppendEntries":
-            res = follower.handle_append_entries(msg)
-            send_message(conn, res)
+        # 3. If leader → send heartbeat
+        if raft.role == NodeRole.LEADER:
+            raft.heartbeat()
 
-        elif msg.get("type") == "RequestVote":
-            # minimal vote logic
-            if msg["term"] >= kv.current_term:
-                kv.current_term = msg["term"]
-                send_message(conn, {"vote_granted": True})
-            else:
-                send_message(conn, {"vote_granted": False})
-
-        # -------- CLIENT --------
-        else:
-            if role != "leader":
-                send_message(conn, {"error": "not leader"})
-            else:
-                res = leader.handle_client(msg)
-                send_message(conn, res)
-
-        conn.close()
+        # 4. Small sleep to prevent CPU burn
+        time.sleep(0.1)
 
 def main():
+    
     host = "127.0.0.1"
-    port = int(input("Port: "))
+    port = int(sys.argv[1])
 
     server(host, port)
 
